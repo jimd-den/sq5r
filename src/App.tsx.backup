@@ -1,0 +1,524 @@
+import { useState, useEffect } from 'react';
+import { GlobalState } from './services/GlobalState';
+import { ViewManager } from './services/ViewManager';
+import { NoteWorkflowService } from './services/NoteWorkflowService';
+import { SpacedRepetitionService } from './services/SpacedRepetitionService';
+import { TimerService } from './services/TimerService';
+import { AudioFeedbackService } from './services/AudioFeedbackService';
+import { SupabasePersistenceService } from './infrastructure/SupabasePersistenceService';
+
+import { HomeView } from './views/HomeView';
+import { NoteListView } from './views/NoteListView';
+import { SurveyView } from './views/SurveyView';
+import { QuestionView } from './views/QuestionView';
+import { ReadView } from './views/ReadView';
+import { RecordView } from './views/RecordView';
+import { ReciteView } from './views/ReciteView';
+import { ReviewView } from './views/ReviewView';
+import { ReflectView } from './views/ReflectView';
+
+import type { ApplicationState, ViewIdentifier } from './services/GlobalState';
+import type { NoteSubject, Note, SurveyElement } from './entities/Note';
+
+const global_state = new GlobalState();
+const note_workflow_service = new NoteWorkflowService();
+const spaced_repetition_service = new SpacedRepetitionService();
+const timer_service = new TimerService();
+const audio_feedback_service = new AudioFeedbackService();
+const persistence_service = new SupabasePersistenceService();
+
+function App() {
+  const [state, setState] = useState<ApplicationState>(global_state.get_state());
+  const [timer_started, setTimerStarted] = useState(false);
+  const [timer_complete, setTimerComplete] = useState(false);
+  const [remaining_time, setRemainingTime] = useState(1500);
+  const [selected_rating, setSelectedRating] = useState(0);
+
+  useEffect(() => {
+    const unsubscribe = global_state.subscribe((new_state) => {
+      setState(new_state);
+    });
+
+    load_initial_data();
+
+    return unsubscribe;
+  }, []);
+
+  const load_initial_data = async () => {
+    try {
+      const subjects = await persistence_service.retrieve_all_note_subjects();
+      const notes = await persistence_service.retrieve_all_notes();
+      const due_reviews = spaced_repetition_service.find_notes_due_for_review(notes);
+
+      global_state.update_state({
+        all_subjects: subjects,
+        all_notes: notes,
+        due_reviews
+      });
+    } catch (error) {
+      console.error('✗ Failed to load data:', error);
+    }
+  };
+
+  const navigate_to_home = () => {
+    global_state.update_state({
+      current_view_identifier: 'home',
+      current_subject: null,
+      current_note: null
+    });
+  };
+
+  const handle_create_subject = () => {
+    const name = prompt('Enter subject name:');
+    if (!name) return;
+
+    audio_feedback_service.play_primary_action_sound();
+
+    const new_subject: NoteSubject = {
+      id: crypto.randomUUID(),
+      name,
+      note_identifiers: []
+    };
+
+    persistence_service.save_note_subject(new_subject)
+      .then(() => {
+        console.log('✓ Subject created successfully');
+        return load_initial_data();
+      })
+      .catch(error => console.error('✗ Failed to create subject:', error));
+  };
+
+  const handle_select_subject = async (subject: NoteSubject) => {
+    audio_feedback_service.play_primary_action_sound();
+
+    const subject_with_notes = await persistence_service.retrieve_note_subject_by_id(subject.id);
+
+    global_state.update_state({
+      current_view_identifier: 'note_list',
+      current_subject: subject_with_notes
+    });
+  };
+
+  const handle_create_note = () => {
+    const title = prompt('Enter note title:');
+    if (!title || !state.current_subject) return;
+
+    audio_feedback_service.play_primary_action_sound();
+
+    const new_note = note_workflow_service.create_new_note(state.current_subject.id, title);
+
+    persistence_service.save_note(new_note)
+      .then(() => {
+        console.log('✓ Note created successfully');
+        global_state.update_state({
+          current_view_identifier: 'survey',
+          current_note: new_note
+        });
+        return load_initial_data();
+      })
+      .catch(error => console.error('✗ Failed to create note:', error));
+  };
+
+  const handle_select_note = (note: Note) => {
+    audio_feedback_service.play_primary_action_sound();
+
+    const view_map: Record<string, ViewIdentifier> = {
+      'SURVEY': 'survey',
+      'QUESTION': 'question',
+      'READ': 'read',
+      'RECORD': 'record',
+      'RECITE': 'recite',
+      'REVIEW': 'review',
+      'REFLECT': 'reflect',
+      'COMPLETED': 'note_list'
+    };
+
+    global_state.update_state({
+      current_view_identifier: view_map[note.current_step] || 'note_list',
+      current_note: note
+    });
+  };
+
+  const handle_add_survey_element = (type: SurveyElement['type']) => {
+    const content = prompt(`Enter ${type}:`);
+    if (!content || !state.current_note) return;
+
+    audio_feedback_service.play_secondary_action_sound();
+
+    const element: SurveyElement = {
+      id: crypto.randomUUID(),
+      type,
+      content
+    };
+
+    const updated_note = note_workflow_service.add_survey_element(state.current_note, element);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({ current_note: updated_note });
+      })
+      .catch(error => console.error('✗ Failed to save element:', error));
+  };
+
+  const handle_survey_next = () => {
+    if (!state.current_note) return;
+    audio_feedback_service.play_success_sound();
+
+    const updated_note = note_workflow_service.advance_to_next_step(state.current_note);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({
+          current_view_identifier: 'question',
+          current_note: updated_note
+        });
+      })
+      .catch(error => console.error('✗ Failed to advance step:', error));
+  };
+
+  const handle_add_question = () => {
+    const text = prompt('Enter your question (How/Why):');
+    if (!text || !state.current_note) return;
+
+    audio_feedback_service.play_secondary_action_sound();
+
+    const question = {
+      id: crypto.randomUUID(),
+      text
+    };
+
+    const updated_note = note_workflow_service.add_question(state.current_note, question);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({ current_note: updated_note });
+      })
+      .catch(error => console.error('✗ Failed to save question:', error));
+  };
+
+  const handle_question_next = () => {
+    if (!state.current_note) return;
+    audio_feedback_service.play_success_sound();
+
+    const updated_note = note_workflow_service.advance_to_next_step(state.current_note);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({
+          current_view_identifier: 'read',
+          current_note: updated_note
+        });
+      })
+      .catch(error => console.error('✗ Failed to advance step:', error));
+  };
+
+  const handle_start_timer = () => {
+    audio_feedback_service.play_primary_action_sound();
+    setTimerStarted(true);
+    setTimerComplete(false);
+
+    timer_service.start_timer(
+      1500,
+      (remaining) => setRemainingTime(remaining),
+      () => {
+        setTimerComplete(true);
+        audio_feedback_service.play_success_sound();
+      }
+    );
+  };
+
+  const handle_read_next = () => {
+    if (!state.current_note) return;
+    audio_feedback_service.play_success_sound();
+
+    const updated_note = note_workflow_service.advance_to_next_step(state.current_note);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        setTimerStarted(false);
+        setTimerComplete(false);
+        setRemainingTime(1500);
+        global_state.update_state({
+          current_view_identifier: 'record',
+          current_note: updated_note
+        });
+      })
+      .catch(error => console.error('✗ Failed to advance step:', error));
+  };
+
+  const handle_answer_mission = (question_id: string) => {
+    const content = prompt('Your answer:');
+    if (!content || !state.current_note) return;
+
+    audio_feedback_service.play_secondary_action_sound();
+
+    const note_element = {
+      id: crypto.randomUUID(),
+      question_id,
+      content
+    };
+
+    const updated_note = note_workflow_service.add_recorded_note(state.current_note, note_element);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({ current_note: updated_note });
+      })
+      .catch(error => console.error('✗ Failed to save answer:', error));
+  };
+
+  const handle_add_side_note = () => {
+    const content = prompt('Side note:');
+    if (!content || !state.current_note) return;
+
+    audio_feedback_service.play_secondary_action_sound();
+
+    const note_element = {
+      id: crypto.randomUUID(),
+      question_id: 'side_note_' + crypto.randomUUID(),
+      content
+    };
+
+    const updated_note = note_workflow_service.add_recorded_note(state.current_note, note_element);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({ current_note: updated_note });
+      })
+      .catch(error => console.error('✗ Failed to save side note:', error));
+  };
+
+  const handle_read_next_section = () => {
+    audio_feedback_service.play_primary_action_sound();
+
+    setTimerStarted(false);
+    setTimerComplete(false);
+    setRemainingTime(1500);
+
+    global_state.update_state({
+      current_view_identifier: 'read'
+    });
+  };
+
+  const handle_finish_recording = () => {
+    if (!state.current_note) return;
+    audio_feedback_service.play_success_sound();
+
+    const updated_note = note_workflow_service.advance_to_next_step(state.current_note);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({
+          current_view_identifier: 'recite',
+          current_note: updated_note
+        });
+      })
+      .catch(error => console.error('✗ Failed to advance step:', error));
+  };
+
+  const handle_recite_answer = (question_id: string) => {
+    const content = prompt('Recite from memory:');
+    if (!content || !state.current_note) return;
+
+    audio_feedback_service.play_secondary_action_sound();
+
+    const note_element = {
+      id: crypto.randomUUID(),
+      question_id,
+      content
+    };
+
+    const updated_note = note_workflow_service.add_recited_note(state.current_note, note_element);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({ current_note: updated_note });
+      })
+      .catch(error => console.error('✗ Failed to save recitation:', error));
+  };
+
+  const handle_recite_next = () => {
+    if (!state.current_note) return;
+    audio_feedback_service.play_success_sound();
+
+    const updated_note = note_workflow_service.advance_to_next_step(state.current_note);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({
+          current_view_identifier: 'review',
+          current_note: updated_note
+        });
+      })
+      .catch(error => console.error('✗ Failed to advance step:', error));
+  };
+
+  const handle_add_correction = (question_id: string) => {
+    const content = prompt('Note corrections or gaps:');
+    if (!content || !state.current_note) return;
+
+    audio_feedback_service.play_secondary_action_sound();
+
+    const correction = {
+      id: crypto.randomUUID(),
+      question_id,
+      content
+    };
+
+    const updated_note = note_workflow_service.add_review_correction(state.current_note, correction);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({ current_note: updated_note });
+      })
+      .catch(error => console.error('✗ Failed to save correction:', error));
+  };
+
+  const handle_select_rating = (rating: number) => {
+    audio_feedback_service.play_primary_action_sound();
+    setSelectedRating(rating);
+
+    if (!state.current_note) return;
+
+    const updated_note = note_workflow_service.set_difficulty_rating(state.current_note, rating);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        global_state.update_state({ current_note: updated_note });
+      })
+      .catch(error => console.error('✗ Failed to save rating:', error));
+  };
+
+  const handle_review_next = () => {
+    if (!state.current_note) return;
+    audio_feedback_service.play_success_sound();
+
+    const updated_note = note_workflow_service.advance_to_next_step(state.current_note);
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        setSelectedRating(0);
+        global_state.update_state({
+          current_view_identifier: 'reflect',
+          current_note: updated_note
+        });
+      })
+      .catch(error => console.error('✗ Failed to advance step:', error));
+  };
+
+  const handle_save_reflection = () => {
+    const reflection_input = document.getElementById('reflection-input') as HTMLTextAreaElement;
+    const reflection = reflection_input?.value || '';
+
+    if (!state.current_note) return;
+
+    audio_feedback_service.play_success_sound();
+
+    let updated_note = note_workflow_service.add_reflection_and_complete(state.current_note, reflection);
+
+    const schedule = spaced_repetition_service.calculate_next_review_date(
+      updated_note,
+      updated_note.rating
+    );
+
+    updated_note = {
+      ...updated_note,
+      next_review_date: schedule.next_review_date,
+      srs_level: schedule.srs_level
+    };
+
+    persistence_service.save_note(updated_note)
+      .then(() => {
+        console.log('✓ Study session completed');
+        return load_initial_data();
+      })
+      .then(() => {
+        navigate_to_home();
+      })
+      .catch(error => console.error('✗ Failed to complete session:', error));
+  };
+
+  const current_notes = state.all_notes.filter(
+    note => note.subject_identifier === state.current_subject?.id
+  );
+
+  return (
+    <>
+      {state.current_view_identifier === 'home' && (
+        <HomeView
+          subjects={state.all_subjects}
+          due_reviews={state.due_reviews}
+          on_create_subject={handle_create_subject}
+          on_select_subject={handle_select_subject}
+          on_select_review={handle_select_note}
+        />
+      )}
+      {state.current_view_identifier === 'note_list' && state.current_subject && (
+        <NoteListView
+          subject={state.current_subject}
+          notes={current_notes}
+          on_back={navigate_to_home}
+          on_create_note={handle_create_note}
+          on_select_note={handle_select_note}
+        />
+      )}
+      {state.current_view_identifier === 'survey' && state.current_note && (
+        <SurveyView
+          note={state.current_note}
+          on_add_element={handle_add_survey_element}
+          on_next={handle_survey_next}
+        />
+      )}
+      {state.current_view_identifier === 'question' && state.current_note && (
+        <QuestionView
+          note={state.current_note}
+          on_add_question={handle_add_question}
+          on_next={handle_question_next}
+        />
+      )}
+      {state.current_view_identifier === 'read' && state.current_note && (
+        <ReadView
+          note={state.current_note}
+          timer_started={timer_started}
+          timer_complete={timer_complete}
+          remaining_time={remaining_time}
+          on_start_timer={handle_start_timer}
+          on_next={handle_read_next}
+        />
+      )}
+      {state.current_view_identifier === 'record' && state.current_note && (
+        <RecordView
+          note={state.current_note}
+          on_answer_mission={handle_answer_mission}
+          on_add_side_note={handle_add_side_note}
+          on_read_next_section={handle_read_next_section}
+          on_finish={handle_finish_recording}
+        />
+      )}
+      {state.current_view_identifier === 'recite' && state.current_note && (
+        <ReciteView
+          note={state.current_note}
+          on_recite_answer={handle_recite_answer}
+          on_next={handle_recite_next}
+        />
+      )}
+      {state.current_view_identifier === 'review' && state.current_note && (
+        <ReviewView
+          note={state.current_note}
+          selected_rating={selected_rating}
+          on_add_correction={handle_add_correction}
+          on_select_rating={handle_select_rating}
+          on_next={handle_review_next}
+        />
+      )}
+      {state.current_view_identifier === 'reflect' && state.current_note && (
+        <ReflectView
+          note={state.current_note}
+          on_save_reflection={handle_save_reflection}
+        />
+      )}
+    </>
+  );
+}
+
+export default App;
